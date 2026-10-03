@@ -1,0 +1,105 @@
+name: Terraform
+# Pull request  -> fmt check, validate, plan  (shows what WOULD change)
+# Push to main  -> plan + apply               (requires approval if you configure the "production" environment)
+on:
+  pull_request:
+    paths: ["terraform/**", ".github/workflows/terraform.yml"]
+  push:
+    branches: [main]
+    paths: ["terraform/**", ".github/workflows/terraform.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false   # never cancel a run that may be applying changes
+
+env:
+  TF_CLOUD_ORGANIZATION: ${{ secrets.TF_CLOUD_ORGANIZATION }}
+  TF_WORKSPACE: snowflake-realtime-platform
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_snowflake_organization_name: ${{ secrets.SNOWFLAKE_ORGANIZATION_NAME }}
+  TF_VAR_snowflake_account_name: ${{ secrets.SNOWFLAKE_ACCOUNT_NAME }}
+  TF_VAR_loader_rsa_public_key: ${{ secrets.LOADER_PUBLIC_KEY }}
+  TF_VAR_dbt_rsa_public_key: ${{ secrets.DBT_PUBLIC_KEY }}
+  TF_VAR_human_user: ${{ secrets.SNOWFLAKE_LOGIN_USER }}
+
+jobs:
+  plan:
+    name: Validate and plan
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TF_VAR_snowflake_user: TERRAFORM_SVC
+      TF_VAR_snowflake_authenticator: WORKLOAD_IDENTITY
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+      - name: Format check
+        run: terraform fmt -check -recursive
+      - name: Init
+        run: terraform init -input=false
+      - name: Validate
+        run: terraform validate
+      - name: Get Snowflake OIDC token
+        shell: bash
+        run: |
+          audience="https://${TF_VAR_snowflake_organization_name}-${TF_VAR_snowflake_account_name}.snowflakecomputing.com"
+          token=$(curl --fail --silent --show-error \
+            --get --data-urlencode "audience=$audience" \
+            --header "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r '.value')
+          test -n "$token" && test "$token" != "null"
+          echo "TF_VAR_snowflake_oidc_token=$token" >> "$GITHUB_ENV"
+      - name: Plan
+        run: |
+          terraform plan -input=false -no-color -out=tfplan | tee plan.txt
+          { echo '### Terraform plan'; echo '```'; tail -n 60 plan.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  apply:
+    name: Apply to Snowflake
+    needs: plan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production        # add "Required reviewers" to this environment for a manual approval gate
+    env:
+      TF_VAR_snowflake_user: TERRAFORM_SVC
+      TF_VAR_snowflake_authenticator: WORKLOAD_IDENTITY
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+      - run: terraform init -input=false
+      - name: Get Snowflake OIDC token
+        shell: bash
+        run: |
+          audience="https://${TF_VAR_snowflake_organization_name}-${TF_VAR_snowflake_account_name}.snowflakecomputing.com"
+          token=$(curl --fail --silent --show-error \
+            --get --data-urlencode "audience=$audience" \
+            --header "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r '.value')
+          test -n "$token" && test "$token" != "null"
+          echo "TF_VAR_snowflake_oidc_token=$token" >> "$GITHUB_ENV"
+      - name: Apply
+        run: terraform apply -input=false -auto-approve
